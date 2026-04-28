@@ -1,0 +1,454 @@
+
+import React, { useState, useEffect } from 'react';
+import { get, set } from 'idb-keyval';
+import Sidebar from './components/Sidebar';
+import DocsView from './components/DocsView';
+import ChatView from './components/ChatView';
+import PurgeView from './components/PurgeView';
+import { Document, AuditLog } from './types';
+import { MOCK_DOCS, CURRENT_WORKSPACE_ID, CURRENT_USER_ID } from './constants';
+import { auth, signInWithGoogle, logout, syncAuditLogToFirebase, getFirebaseAuditLogs } from './services/firebaseService';
+import { onAuthStateChanged, User } from 'firebase/auth';
+
+const App: React.FC = () => {
+  const [activeTab, setActiveTab] = useState('docs');
+  const [docs, setDocs] = useState<Document[]>([]);
+  const [auditLogs, setAuditLogs] = useState<AuditLog[]>([]);
+  const [isSidebarOpen, setIsSidebarOpen] = useState(false);
+  const [isLoaded, setIsLoaded] = useState(false);
+  const [serverMode, setServerMode] = useState<'cloud' | 'local'>('cloud');
+  const [user, setUser] = useState<User | null>(null);
+
+  useEffect(() => {
+    const unsubscribe = onAuthStateChanged(auth, (currentUser) => {
+      setUser(currentUser);
+    });
+    return () => unsubscribe();
+  }, []);
+
+  // Persistence Layer: Load from IndexedDB on mount
+  useEffect(() => {
+    const loadData = async () => {
+      try {
+        const savedDocs = await get('eburon_docs');
+        const savedLogs = await get('eburon_logs');
+        const savedServer = await get('eburon_server_mode');
+
+        if (savedDocs) setDocs(savedDocs);
+        else setDocs(MOCK_DOCS);
+
+        const fbLogs = await getFirebaseAuditLogs();
+        if (savedLogs || fbLogs.length > 0) {
+          // Merge avoiding duplicates based on log id
+          const mergedLogsMap = new Map<string, AuditLog>();
+          if (savedLogs) savedLogs.forEach((l: any) => mergedLogsMap.set(l.id, l));
+          fbLogs.forEach((l: any) => mergedLogsMap.set(l.id, l));
+          setAuditLogs(Array.from(mergedLogsMap.values()).sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()));
+        }
+
+        if (savedServer) setServerMode(savedServer as 'cloud' | 'local');
+      } catch (error) {
+        console.error("Failed to load data from IndexedDB", error);
+        setDocs(MOCK_DOCS);
+      } finally {
+        setIsLoaded(true);
+      }
+    };
+    loadData();
+  }, []);
+
+  // Persistence Layer: Save to IndexedDB on change
+  useEffect(() => {
+    if (isLoaded) {
+      set('eburon_docs', docs).catch(console.error);
+    }
+  }, [docs, isLoaded]);
+
+  useEffect(() => {
+    if (isLoaded) {
+      set('eburon_logs', auditLogs).catch(console.error);
+    }
+  }, [auditLogs, isLoaded]);
+
+  useEffect(() => {
+    if (isLoaded) {
+      set('eburon_server_mode', serverMode).catch(console.error);
+    }
+  }, [serverMode, isLoaded]);
+
+  const addAuditLog = (action: string, targetType: string, targetId?: string, metadata?: any) => {
+    const log: AuditLog = {
+      id: `LOG-BE-${Date.now()}`,
+      workspaceId: CURRENT_WORKSPACE_ID,
+      actorId: user?.uid || CURRENT_USER_ID,
+      action,
+      targetType,
+      targetId,
+      metadata: { ...metadata, compliance: 'GDPR_V2_AUDIT', server: serverMode },
+      createdAt: new Date().toISOString()
+    };
+    setAuditLogs(prev => [log, ...prev]);
+    syncAuditLogToFirebase(log);
+  };
+
+
+  const handleUpload = async (files: FileList) => {
+    const filePromises = Array.from(files).map((f, i) => {
+      return new Promise<Document>((resolve) => {
+        const reader = new FileReader();
+        reader.onloadend = () => {
+          resolve({
+            id: `be-file-${Date.now()}-${i}`,
+            workspaceId: CURRENT_WORKSPACE_ID,
+            title: f.name,
+            sourceType: 'upload',
+            status: 'processing',
+            ocrStatus: 'pending',
+            ocrProgress: 0,
+            createdAt: new Date().toISOString(),
+            mimeType: f.type || 'application/octet-stream',
+            bytes: f.size,
+            text: "Infrastructure is scanning and extracting structured content...",
+            protected: false,
+            fileData: reader.result as string
+          });
+        };
+        reader.readAsDataURL(f);
+      });
+    });
+
+    const newDocs = await Promise.all(filePromises);
+
+    setDocs(prev => [...prev, ...newDocs]);
+    addAuditLog('INGEST_INIT', 'GOV_DOC_BATCH', undefined, { count: newDocs.length, filenames: newDocs.map(d => d.title) });
+
+    // Simulate async processing with progress and AI metadata extraction
+    const docIds = newDocs.map(d => d.id);
+    let iter = 0;
+    const interval = setInterval(() => {
+      iter++;
+      if (iter >= 4) {
+        clearInterval(interval);
+        setDocs(prev => prev.map(d => 
+          docIds.includes(d.id) ? { 
+            ...d, 
+            status: 'ready', 
+            ocrStatus: 'completed',
+            ocrProgress: 100,
+            metadata: {
+              sender: "EU Customs Authority",
+              recipient: "DKM Node Antwerp",
+              documentDate: new Date().toISOString().split('T')[0],
+              summary: "Verified import manifest containing certified electronics cargo details."
+            },
+            text: `Administrative analysis completed for ${d.title}. Intelligence patterns extracted and indexed for retrieval.` 
+          } : d
+        ));
+      } else {
+        setDocs(prev => prev.map(d => 
+          docIds.includes(d.id) ? { ...d, ocrProgress: iter * 25 } : d
+        ));
+      }
+    }, 800);
+  };
+
+  /**
+   * User Requested: Manual OCR Trigger logic
+   */
+  const handleTriggerOCR = (ids: string[]) => {
+    // Set immediate processing state
+    setDocs(prev => prev.map(d => 
+      ids.includes(d.id) ? { ...d, status: 'processing', ocrStatus: 'pending', ocrProgress: 0, ocrErrorMessage: undefined } : d
+    ));
+    addAuditLog('MANUAL_OCR_TRIGGER', 'DOCUMENT_BATCH', undefined, { count: ids.length, documentIds: ids });
+
+    let iter = 0;
+    const interval = setInterval(() => {
+      iter++;
+      if(iter >= 4) {
+        clearInterval(interval);
+        // Simulate OCR finish with failure/success probability
+        setDocs(prev => prev.map(d => {
+          if (!ids.includes(d.id)) return d;
+
+          // 10% failure rate for demo realism
+          const isSuccess = Math.random() > 0.1;
+          
+          return { 
+            ...d, 
+            status: isSuccess ? 'ready' : 'error', 
+            ocrStatus: isSuccess ? 'completed' : 'failed', 
+            ocrProgress: isSuccess ? 100 : undefined,
+            ocrErrorMessage: isSuccess ? undefined : `System Error: OCR engine failure during document flattening. Fault code: 0x${Math.floor(Math.random() * 16777215).toString(16).toUpperCase()}.`,
+            text: isSuccess 
+              ? `On-demand administrative verification completed for ${d.title}. Internal audit trace: ${Math.random().toString(36).substring(2, 9).toUpperCase()}. Infrastructure node: ${serverMode.toUpperCase()}`
+              : `System Error: OCR engine failure during document flattening. Fault code: 0x${Math.floor(Math.random() * 16777215).toString(16).toUpperCase()}.`
+          };
+        }));
+      } else {
+        setDocs(prev => prev.map(d => 
+          ids.includes(d.id) ? { ...d, ocrProgress: iter * 25 } : d
+        ));
+      }
+    }, 600);
+  };
+
+  const handleDelete = (id: string) => {
+    const doc = docs.find(d => d.id === id);
+    if (doc?.protected) {
+      alert("This document is under Legal Hold and cannot be deleted.");
+      return;
+    }
+    setDocs(prev => prev.filter(d => d.id !== id));
+    addAuditLog('MANUAL_DELETE', 'DOCUMENT', id);
+  };
+
+  const handleBulkDelete = (ids: string[]) => {
+    const targetDocs = docs.filter(d => ids.includes(d.id));
+    const protectedCount = targetDocs.filter(d => d.protected).length;
+    const deleteableIds = targetDocs.filter(d => !d.protected).map(d => d.id);
+    
+    setDocs(prev => prev.filter(d => !deleteableIds.includes(d.id)));
+    addAuditLog('BULK_DELETE', 'DOCUMENT_BATCH', undefined, { 
+      requestedCount: ids.length, 
+      deletedCount: deleteableIds.length,
+      skippedProtected: protectedCount 
+    });
+
+    if (protectedCount > 0) {
+      alert(`${protectedCount} document(s) were retained as they are under Legal Hold.`);
+    }
+  };
+
+  const handleToggleProtect = (ids: string[], isProtected: boolean) => {
+    setDocs(prev => prev.map(d => ids.includes(d.id) ? { ...d, protected: isProtected } : d));
+    addAuditLog(isProtected ? 'SET_PROTECTION' : 'RELEASE_PROTECTION', 'DOCUMENT_BATCH', undefined, { 
+      count: ids.length,
+      protectionState: isProtected ? 'LOCKED' : 'UNLOCKED'
+    });
+  };
+
+  const handlePurge = (filter: any) => {
+    const cutoff = new Date();
+    cutoff.setDate(cutoff.getDate() - filter.olderThanDays);
+    
+    // Crucial compliance check: Filter out documents with 'protected' flag
+    const toDelete = docs.filter(d => new Date(d.createdAt) < cutoff && !d.protected);
+    const skippedProtected = docs.filter(d => new Date(d.createdAt) < cutoff && d.protected).length;
+    
+    setDocs(prev => prev.filter(d => !toDelete.some(td => td.id === d.id)));
+    addAuditLog('COMPLIANCE_PURGE', 'WORKSPACE_CLEANUP', undefined, { 
+      filter, 
+      deletedCount: toDelete.length,
+      skippedProtected 
+    });
+    
+    alert(`Administrative Purge Complete: ${toDelete.length} records erased. ${skippedProtected} protected records retained for compliance.`);
+  };
+
+  if (!isLoaded) {
+    return (
+      <div className="flex bg-[#F5F5F7] min-h-screen items-center justify-center p-4">
+        <div className="flex flex-col items-center gap-4 text-[#86868B]">
+          <div className="w-10 h-10 border-4 border-[#007AFF] border-t-transparent rounded-full animate-spin"></div>
+          <p className="font-semibold text-sm">Loading Eburon Environment...</p>
+        </div>
+      </div>
+    );
+  }
+
+  if (!user) {
+    return (
+      <div className="flex bg-[#F5F5F7] min-h-screen font-sans flex-col items-center justify-center p-4">
+        <div className="bg-white p-8 md:p-12 rounded-3xl shadow-xl w-full max-w-md text-center border border-[#E5E5EA]">
+          <div className="w-20 h-20 bg-[#007AFF]/10 text-[#007AFF] rounded-2xl flex items-center justify-center mx-auto mb-6">
+            <i className="fa-solid fa-shield-halved text-4xl"></i>
+          </div>
+          <h1 className="text-2xl font-semibold text-[#1D1D1F] mb-2 tracking-tight">Eburon Authentication</h1>
+          <p className="text-[#86868B] text-sm mb-8">Secure login required to access governmental documents and audit logs.</p>
+          <button
+            onClick={signInWithGoogle}
+            className="w-full relative flex items-center justify-center gap-3 bg-white border border-[#E5E5EA] text-[#1D1D1F] px-6 py-3.5 rounded-xl font-semibold transition-all hover:-translate-y-0.5 hover:shadow-md active:bg-[#F5F5F7]"
+          >
+            <i className="fa-brands fa-google text-[#007AFF] text-lg"></i>
+            Continue with Google
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="flex bg-[#F5F5F7] min-h-screen font-sans overflow-x-hidden text-[#1D1D1F] selection:bg-[#007AFF]/20 selection:text-[#007AFF]">
+      <button 
+        onClick={() => setIsSidebarOpen(!isSidebarOpen)}
+        className="md:hidden fixed top-4 right-4 z-[60] bg-white text-[#1D1D1F] w-12 h-12 rounded-full flex items-center justify-center shadow-md border border-[#E5E5EA] transition-transform active:scale-90"
+      >
+        <i className={`fa-solid ${isSidebarOpen ? 'fa-xmark' : 'fa-bars-staggered'}`}></i>
+      </button>
+
+      {isSidebarOpen && (
+        <div className="fixed inset-0 bg-[#00000033] backdrop-blur-sm z-[55] md:hidden" onClick={() => setIsSidebarOpen(false)} />
+      )}
+
+      <Sidebar 
+        activeTab={activeTab} 
+        setActiveTab={(tab) => { setActiveTab(tab); setIsSidebarOpen(false); }} 
+        isOpen={isSidebarOpen}
+      />
+      
+      <main className={`flex-1 transition-all duration-300 ${isSidebarOpen ? 'ml-0' : 'md:ml-64'} min-h-screen w-full`}>
+        <div className="md:ml-0 pt-20 md:pt-0">
+          {activeTab === 'docs' && (
+            <DocsView 
+              documents={docs} 
+              onUpload={handleUpload} 
+              onDelete={handleDelete}
+              onBulkDelete={handleBulkDelete}
+              onToggleProtect={handleToggleProtect}
+              onTriggerOCR={handleTriggerOCR}
+            />
+          )}
+          
+          {activeTab === 'chat' && (
+            <ChatView documents={docs.filter(d => d.status === 'ready')} onUpload={handleUpload} />
+          )}
+          
+          {activeTab === 'purge' && (
+            <PurgeView documents={docs} onExecutePurge={handlePurge} />
+          )}
+
+          {activeTab === 'audit' && (
+            <div className="p-4 md:p-6 max-w-6xl mx-auto">
+              <header className="mb-10">
+                <h1 className="text-2xl md:text-3xl font-black text-slate-900 tracking-tight uppercase border-b-4 border-slate-900 pb-2 inline-block">Administrative Audit Logs</h1>
+                <p className="text-slate-500 mt-3 text-sm font-medium">Official forensic record for SPF/FPS compliance monitoring and APD/GBA disclosure.</p>
+              </header>
+              <div className="bg-white rounded-3xl border border-slate-200 overflow-hidden shadow-xl shadow-slate-200/50 overflow-x-auto">
+                <table className="w-full text-left text-sm min-w-[800px]">
+                  <thead className="bg-slate-50 border-b border-slate-200">
+                    <tr>
+                      <th className="px-6 py-5 font-black text-slate-400 text-[10px] uppercase tracking-widest">Action Event</th>
+                      <th className="px-6 py-5 font-black text-slate-400 text-[10px] uppercase tracking-widest">Authority ID</th>
+                      <th className="px-6 py-5 font-black text-slate-400 text-[10px] uppercase tracking-widest">Resource Type</th>
+                      <th className="px-6 py-5 font-black text-slate-400 text-[10px] uppercase tracking-widest text-right">Verification Metadata</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-100">
+                    {auditLogs.length === 0 ? (
+                       <tr>
+                         <td colSpan={4} className="px-6 py-20 text-center text-slate-400 italic">No administrative events recorded in this session.</td>
+                       </tr>
+                    ) : auditLogs.map(log => (
+                      <tr key={log.id} className="hover:bg-slate-50/50 transition-colors">
+                        <td className="px-6 py-5 font-black text-blue-900 text-xs">{log.action}</td>
+                        <td className="px-6 py-5 text-slate-400 font-mono text-[10px]">{log.actorId}</td>
+                        <td className="px-6 py-5">
+                          <span className="bg-slate-100 px-2 py-0.5 rounded-lg text-[10px] font-black text-slate-600 border border-slate-200">
+                            {log.targetType}
+                          </span>
+                        </td>
+                        <td className="px-6 py-5 text-right text-[10px] text-slate-400 font-mono">
+                          {JSON.stringify(log.metadata || {})}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
+
+          {activeTab === 'settings' && (
+            <div className="p-4 md:p-6 max-w-4xl mx-auto space-y-8">
+              <header className="mb-10">
+                <h1 className="text-2xl md:text-3xl font-black text-slate-900 tracking-tight uppercase border-b-4 border-slate-900 pb-2 inline-block">System Infrastructure</h1>
+                <p className="text-slate-500 mt-3 text-sm font-medium">Configure secure processing nodes and institutional jurisdictional settings.</p>
+              </header>
+
+              <div className="grid md:grid-cols-1 gap-8">
+                {/* Server Settings */}
+                <section className="bg-white rounded-3xl border border-slate-200 p-6 md:p-10 space-y-8 shadow-xl shadow-slate-200/50">
+                  <div className="flex items-center justify-between border-b border-slate-100 pb-6">
+                    <div className="flex items-center gap-4">
+                      <div className="w-12 h-12 rounded-2xl bg-blue-100 flex items-center justify-center text-blue-600 text-xl shadow-inner">
+                        <i className="fa-solid fa-microchip"></i>
+                      </div>
+                      <div>
+                        <h3 className="font-black text-slate-900 uppercase text-sm tracking-tight">Intelligence Node Selection</h3>
+                        <p className="text-xs text-slate-400 font-medium">Select compliant compute environment for OCR/RAG operations.</p>
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                    <button 
+                      onClick={() => setServerMode('cloud')}
+                      className={`p-6 rounded-3xl border-2 text-left transition-all relative group ${serverMode === 'cloud' ? 'border-blue-600 bg-blue-50/50 ring-4 ring-blue-50' : 'border-slate-100 hover:border-slate-300'}`}
+                    >
+                      <div className="flex justify-between items-start mb-4">
+                        <div className={`w-10 h-10 rounded-xl flex items-center justify-center transition-colors ${serverMode === 'cloud' ? 'bg-blue-600 text-white' : 'bg-slate-100 text-slate-400 group-hover:bg-slate-200'}`}>
+                          <i className="fa-solid fa-cloud-bolt"></i>
+                        </div>
+                        {serverMode === 'cloud' && <i className="fa-solid fa-circle-check text-blue-600 text-xl"></i>}
+                      </div>
+                      <p className="font-black text-slate-900 uppercase text-xs tracking-wider">Sovereign Cloud Node</p>
+                      <p className="text-[11px] text-slate-500 leading-relaxed mt-2 font-medium">Secured FPS environment for high-throughput administrative processing.</p>
+                    </button>
+
+                    <button 
+                      onClick={() => setServerMode('local')}
+                      className={`p-6 rounded-3xl border-2 text-left transition-all relative group ${serverMode === 'local' ? 'border-blue-600 bg-blue-50/50 ring-4 ring-blue-50' : 'border-slate-100 hover:border-slate-300'}`}
+                    >
+                      <div className="flex justify-between items-start mb-4">
+                        <div className={`w-10 h-10 rounded-xl flex items-center justify-center transition-colors ${serverMode === 'local' ? 'bg-blue-600 text-white' : 'bg-slate-100 text-slate-400 group-hover:bg-slate-200'}`}>
+                          <i className="fa-solid fa-shield-halved"></i>
+                        </div>
+                        {serverMode === 'local' && <i className="fa-solid fa-circle-check text-blue-600 text-xl"></i>}
+                      </div>
+                      <p className="font-black text-slate-900 uppercase text-xs tracking-wider">Local Private Node</p>
+                      <p className="text-[11px] text-slate-500 leading-relaxed mt-2 font-medium">Air-gapped on-premise infrastructure. No external traffic footprint.</p>
+                    </button>
+                  </div>
+                </section>
+
+                <section className="bg-white rounded-3xl border border-slate-200 p-6 md:p-10 space-y-8 shadow-xl shadow-slate-200/50">
+                  <div className="flex items-center gap-2 mb-6 border-l-4 border-yellow-400 pl-4">
+                     <h3 className="font-black text-slate-900 uppercase text-sm tracking-tight">Officer Registry Profile</h3>
+                  </div>
+                  <div className="grid md:grid-cols-2 gap-8">
+                    <div>
+                      <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest block mb-3">Institutional Service Entity</label>
+                      <input type="text" readOnly defaultValue="FPS BOSA - DIGITAL TRANSFORMATION" className="w-full bg-slate-50 border border-slate-200 rounded-2xl px-5 py-4 text-slate-600 font-bold text-sm focus:outline-none" />
+                    </div>
+                    <div>
+                      <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest block mb-3">Administrative Jurisdiction</label>
+                      <select className="w-full bg-white border border-slate-200 rounded-2xl px-5 py-4 text-sm font-bold text-slate-800 focus:ring-2 focus:ring-blue-500/20 appearance-none">
+                         <option>BE-FEDERAL (Kingdom level)</option>
+                         <option>BE-VLG (Flanders)</option>
+                         <option>BE-WAL (Wallonia)</option>
+                         <option>BE-BCR (Brussels)</option>
+                      </select>
+                    </div>
+                  </div>
+                </section>
+
+                <section className="pt-4">
+                  <div className="p-6 bg-red-50 border border-red-100 rounded-3xl flex flex-col md:flex-row items-center justify-between gap-6 shadow-sm">
+                    <div className="text-center md:text-left">
+                      <p className="text-sm font-black text-red-900 uppercase tracking-tight">Security Decommissioning</p>
+                      <p className="text-[11px] text-red-800 opacity-70 mt-1 font-medium italic">Complete institutional wipe. This action initiates a secure erasure of all metadata and audit logs from this node.</p>
+                    </div>
+                    <button className="bg-red-600 text-white px-8 py-3 rounded-2xl text-[11px] font-black uppercase tracking-widest hover:bg-red-700 transition-all shadow-lg shadow-red-900/20 active:scale-95 whitespace-nowrap">Node Wipe</button>
+                  </div>
+                </section>
+              </div>
+            </div>
+          )}
+        </div>
+      </main>
+    </div>
+  );
+};
+
+export default App;
